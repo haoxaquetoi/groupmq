@@ -80,6 +80,18 @@ export async function evalScript<T = any>(
   argv: Array<string>,
   numKeys: number,
 ): Promise<T> {
-  const sha = await loadScript(client, name);
-  return (client as any).evalsha(sha, numKeys, ...argv);
+  try {
+    const sha = await loadScript(client, name);
+    return await (client as any).evalsha(sha, numKeys, ...argv);
+  } catch (err: unknown) {
+    const msg =
+      err && typeof err === 'object' && 'message' in err
+        ? String((err as { message: unknown }).message)
+        : String(err);
+    if (!/NOSCRIPT|no matching script/i.test(msg)) throw err;
+    const map = cacheByClient.get(client);
+    if (map) map.delete(name);
+    const sha = await loadScript(client, name);
+    return await (client as any).evalsha(sha, numKeys, ...argv);
+  }
 }

@@ -1349,143 +1349,126 @@ export class Queue<T = any> {
     );
   }
 
-  async reserveBlocking(
-    timeoutSec = 5,
-    blockUntil?: number,
-    blockingClient?: import('ioredis').default,
-  ): Promise<ReservedJob<T> | null> {
-    const startTime = Date.now();
+async reserveBlocking(timeoutSec = 5, blockUntil, blockingClient) {
+		const startTime = Date.now();
+		if (await this.isPaused()) {
+			await sleep$1(50);
+			return null;
+		}
+		if (!(this._consecutiveEmptyReserves >= 3)) {
+			const immediateJob = await this.reserve();
+			if (immediateJob) {
+				this.logger.debug(`Immediate reserve successful (${Date.now() - startTime}ms)`);
+				this._consecutiveEmptyReserves = 0;
+				return immediateJob;
+			}
+		}
+		const adaptiveTimeout = this.getBlockTimeout(timeoutSec, blockUntil);
+		if (this._consecutiveEmptyReserves % 10 === 0) this.logger.debug(`Starting blocking operation (timeout: ${adaptiveTimeout}s, consecutive empty: ${this._consecutiveEmptyReserves})`);
+		const readyKey = nsKey(this.ns, "ready");
+		try {
+			const bzpopminStart = Date.now();
+			const result = await (blockingClient ?? this.r).bzpopmin(readyKey, adaptiveTimeout);
+			const bzpopminDuration = Date.now() - bzpopminStart;
+			if (!result || result.length < 3) {
+				this.logger.debug(`Blocking timeout/empty (took ${bzpopminDuration}ms)`);
+				this._consecutiveEmptyReserves = this._consecutiveEmptyReserves + 1;
+				return null;
+			}
+			const [, groupId, score] = result;
+			if (this._consecutiveEmptyReserves % 10 === 0) this.logger.debug(`Blocking result: group=${groupId}, score=${score} (took ${bzpopminDuration}ms)`);
+			const reserveStart = Date.now();
+			const job = await this.reserveAtomic(groupId);
+			const reserveDuration = Date.now() - reserveStart;
+			if (job) {
+				this.logger.debug(`Successful job reserve after blocking: ${job.id} from group ${job.groupId} (reserve took ${reserveDuration}ms)`);
+				this._consecutiveEmptyReserves = 0;
+			} 
+			else{
+				// Group found but reserve failed - ALWAYS check the head job
+				const groupKey = `${this.ns}:g:${groupId}`;
+				const firstJobIds = await this.r.zrange(groupKey, 0, 0);
+			  	this.logger.debug(
+						`groupKey ${groupKey}`,
+					  );
+				this.logger.debug('sssss--->',firstJobIds);
+				if (firstJobIds.length > 0) {
+				  const firstJobId = firstJobIds[0];
+				  const jobKey = `${this.ns}:job:${firstJobId}`;
+				  const [status, delayUntil, processedOn,lastErrorMessage,attempts] = await this.r.hmget(
+					jobKey, 'status', 'delayUntil', 'processedOn','lastErrorMessage','attempts'
+				  );
+				  this.logger.debug('lastErrorMessage--->',lastErrorMessage);
+				  if(String(lastErrorMessage).trim() !== '' && parseInt(attempts) >= 3){
+						this.logger.debug(`H0 Group ${groupId} head job ${firstJobId} delayed for ${String(lastErrorMessage)}ms. Not restoring.`);
+						this._consecutiveEmptyReserves++;
+						return null;
+				  }
+			  
+				  // Kiểm tra job delayed
+				  if (status === 'delayed' && delayUntil) {
+					const due = parseInt(delayUntil, 10);
+					const now = Date.now();
+					if (due > now) {
+					  this.logger.debug(
+						`E001 Group ${groupId} head job ${firstJobId} delayed for ${due - now}ms. Not restoring.`,
+					  );
+					  this._consecutiveEmptyReserves++;
+					  return null;
+					}
+				  }
+			 	  this.logger.debug( 'E002 ---------------status='+status + '      firstJobId='+firstJobId);
+				  //THÊM: Kiểm tra job processing nhưng có thể là zombie
+				  if (status === 'processing') {
+					const now = Date.now();
+					const processedTime = processedOn ? parseInt(processedOn, 10) : 0;
+					const processingDuration = processedTime > 0 ? now - processedTime : 0;
+					const TEN_MINUTES_MS = 3000_000; // 5 phút
+					this.logger.debug( 'E006 processingDuration='+processingDuration);
+					if (processingDuration <= TEN_MINUTES_MS) {
+					  // Job zombie - đánh dấu failed và cleanup
+					  this.logger.warn(
+						`E003 Group ${groupId} head job ${firstJobId} has been processing for ${Math.round(processingDuration / 1000)}s (>5 min). Marking as failed.`,
+					  );
+					  await this.r.hset(jobKey, 'status', 'failed', 'failedReason', 'Processing timeout (>5 min)');
+					  await this.r.zrem(`${this.ns}:processing`, firstJobId);
+					  await this.r.del(`${this.ns}:processing:${firstJobId}`);
+					  await this.r.del(`${this.ns}:g:${groupId}:active`);
+					  // Không return - để logic phía dưới restore group với job tiếp theo
+					} else {
+					  // Job vẫn đang được xử lý hợp lệ - không restore
+					  this.logger.debug(
+						`E004 Group ${groupId} head job ${firstJobId} processing for ${Math.round(processingDuration / 1000)}s (<5 min). Not restoring.`,
+					  );
+					  this._consecutiveEmptyReserves++;
+					  return null;
+					}
+				  }
+				}
+			  
+				// Restore group to :ready
+				const jobCount = await this.r.zcard(groupKey);
+				if (jobCount > 0) {
+				  await this.r.zadd(readyKey, Number(score), groupId);
+				  this.logger.debug(`E005 -- Restored group ${groupId} add `);
+				}
+			}
 
-    // Short-circuit if paused
-    if (await this.isPaused()) {
-      await sleep(50);
-      return null;
-    }
-
-    // Fast path optimization: Skip immediate reserve if we recently had empty reserves
-    // This avoids wasteful Lua script calls when queue is idle
-    // After 3 consecutive empty reserves, go straight to blocking for better performance
-    const skipImmediateReserve = this._consecutiveEmptyReserves >= 3;
-
-    if (!skipImmediateReserve) {
-      // Fast path: try immediate reserve first (avoids blocking when jobs are available)
-      const immediateJob = await this.reserve();
-      if (immediateJob) {
-        this.logger.debug(
-          `Immediate reserve successful (${Date.now() - startTime}ms)`,
-        );
-        // Reset consecutive empty reserves counter when we get a job via fast path
-        this._consecutiveEmptyReserves = 0;
-        return immediateJob;
-      }
-    }
-
-    // Use BullMQ-style adaptive timeout with delayed job consideration
-    const adaptiveTimeout = this.getBlockTimeout(timeoutSec, blockUntil);
-
-    // Only log blocking operations every 10th time to reduce spam
-    if (this._consecutiveEmptyReserves % 10 === 0) {
-      this.logger.debug(
-        `Starting blocking operation (timeout: ${adaptiveTimeout}s, consecutive empty: ${this._consecutiveEmptyReserves})`,
-      );
-    }
-
-    // Use ready queue for blocking behavior (more reliable than marker system)
-    const readyKey = nsKey(this.ns, 'ready');
-
-    try {
-      // Avoid extra zcard during every blocking call to reduce Redis CPU
-
-      // Use dedicated blocking connection to avoid interfering with other operations
-      const bzpopminStart = Date.now();
-      const client = blockingClient ?? this.r;
-      const result = await client.bzpopmin(readyKey, adaptiveTimeout);
-      const bzpopminDuration = Date.now() - bzpopminStart;
-
-      if (!result || result.length < 3) {
-        this.logger.debug(
-          `Blocking timeout/empty (took ${bzpopminDuration}ms)`,
-        );
-        // Track consecutive empty reserves for adaptive timeout
-        this._consecutiveEmptyReserves = this._consecutiveEmptyReserves + 1;
-        return null; // Timeout or no result
-      }
-
-      const [, groupId, score] = result;
-
-      // Only log blocking results every 10th time to reduce spam
-      if (this._consecutiveEmptyReserves % 10 === 0) {
-        this.logger.debug(
-          `Blocking result: group=${groupId}, score=${score} (took ${bzpopminDuration}ms)`,
-        );
-      }
-
-      // Try to reserve atomically from the specific group to eliminate race conditions
-      const reserveStart = Date.now();
-      const job = await this.reserveAtomic(groupId);
-      const reserveDuration = Date.now() - reserveStart;
-
-      if (job) {
-        this.logger.debug(
-          `Successful job reserve after blocking: ${job.id} from group ${job.groupId} (reserve took ${reserveDuration}ms)`,
-        );
-        // Reset consecutive empty reserves counter
-        this._consecutiveEmptyReserves = 0;
-      } else {
-        this.logger.warn(
-          `Blocking found group but reserve failed: group=${groupId} (reserve took ${reserveDuration}ms)`,
-        );
-
-        // Check if group actually has jobs before restoring to prevent infinite loops
-        // This prevents poisoned groups (empty groups in ready queue) from being restored
-        try {
-          const groupKey = `${this.ns}:g:${groupId}`;
-          const jobCount = await this.r.zcard(groupKey);
-
-          if (jobCount > 0) {
-            // Group has jobs, restore it to ready queue
-            await this.r.zadd(readyKey, Number(score), groupId);
-            this.logger.debug(
-              `Restored group ${groupId} to ready with score ${score} after failed atomic reserve (${jobCount} jobs)`,
-            );
-          } else {
-            // Group is empty (poisoned), don't restore it
-            this.logger.warn(
-              `Not restoring empty group ${groupId} - preventing poisoned group loop`,
-            );
-          }
-        } catch (_e) {
-          // If check fails, err on the side of not restoring to prevent infinite loops
-          this.logger.warn(
-            `Failed to check group ${groupId} job count, not restoring`,
-          );
-        }
-
-        // Increment consecutive empty reserves and fall back to general reserve scan
-        this._consecutiveEmptyReserves = this._consecutiveEmptyReserves + 1;
-        return this.reserve();
-      }
-      return job;
-    } catch (err) {
-      const errorDuration = Date.now() - startTime;
-      this.logger.error(`Blocking error after ${errorDuration}ms:`, err);
-
-      // Enhanced error handling - check if it's a connection error
-      if (this.isConnectionError(err)) {
-        this.logger.error(`Connection error detected - rethrowing`);
-        // For connection errors, don't fall back immediately
-        throw err;
-      }
-      // For other errors, fall back to regular reserve
-      this.logger.warn(`Falling back to regular reserve due to error`);
-      return this.reserve();
-    } finally {
-      const totalDuration = Date.now() - startTime;
-      if (totalDuration > 1000) {
-        this.logger.debug(`ReserveBlocking completed in ${totalDuration}ms`);
-      }
-    }
-  }
+			return job;
+		} catch (err) {
+			const errorDuration = Date.now() - startTime;
+			this.logger.error(`Blocking error after ${errorDuration}ms:`, err);
+			if (this.isConnectionError(err)) {
+				this.logger.error(`Connection error detected - rethrowing`);
+				throw err;
+			}
+			this.logger.warn(`Falling back to regular reserve due to error`);
+			return this.reserve();
+		} finally {
+			const totalDuration = Date.now() - startTime;
+			if (totalDuration > 1e3) this.logger.debug(`ReserveBlocking completed in ${totalDuration}ms`);
+		}
+	}
 
   /**
    * Reserve a job from a specific group atomically (eliminates race conditions)
